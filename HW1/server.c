@@ -32,14 +32,9 @@ typedef struct {
     char buf[512];   // data sent by/to client
     size_t buf_len;  // bytes used by buf
     // you don't need to change this.
-    int id;
+    int id;     // indicate the connected id
     int stage;  // 0: ask id 1: ask the order
 } request;
-
-/*
-    wait_for_write 1: wait for the client to fill the ID
-    wait_for_write 2: wait for the client to fill in the preference
-*/
 
 typedef struct {
     int id;  //902001-902020
@@ -47,16 +42,7 @@ typedef struct {
     int BNT;
     int Moderna;
 } registerRecord;
-/*
-int lock_reg(int fd, int cmd, int type, off_t offset, int whence, off_t len) {
-    struct flock lock;
-    lock.l_type = type;
-    lock.l_start = offset;
-    lock.l_whence = whence;
-    lock.l_len = len;
-    return (fcntl(fd, cmd, &lock));
-}
-*/
+
 int lock(int fd, int id, short lock_type) {
     struct flock lock;
     lock.l_type = lock_type;
@@ -72,14 +58,8 @@ int unlock(int fd, int id) {
     lock.l_start = sizeof(registerRecord) * (id - 902001);
     lock.l_whence = SEEK_SET;
     lock.l_len = sizeof(registerRecord);
-    return (fcntl(fd, F_SETLK, &lock));
+    return (fcntl(fd, F_SETLKW, &lock));
 }
-
-#define _read_lock(fd, offset, whence, len) \
-    lock_reg((fd), F_SETLK, F_RDLCK, (offset), (whence), (len))
-
-#define _write_lock(fd, offset, whence, len) \
-    lock_reg((fd), F_SETLK, F_WRLCK, (offset), (whence), (len))
 
 server svr;                // server
 request *requestP = NULL;  // pointer to a list of requests
@@ -97,43 +77,15 @@ static void init_request(request *reqP);
 static void free_request(request *reqP);
 // free resources used by a request instance
 
-/*
-inline int read_lock(int fd, int id) {
-    return _read_lock(fd, sizeof(registerRecord)*(id-902001), SEEK_SET, sizeof(registerRecord));
+ssize_t read_record(int rfd, registerRecord *reg, int id) {
+    lseek(rfd, sizeof(registerRecord) * (id - 902001), SEEK_SET);
+    return read(rfd, reg, sizeof(registerRecord));
 }
 
-inline int write_lock(int fd, int id) {
-    return _write_lock(fd, sizeof(registerRecord)*(id-902001), SEEK_SET, sizeof(registerRecord));
-}
-*/
-
-int init_record(registerRecord *reg) {
-    int outfile = open("registerRecord", O_RDONLY);
-    if (outfile < 0) {
-        fprintf(stderr, "Error on opening registerRecord\n");
-        return -1;
-    }
-    // lock
-    read(outfile, reg, sizeof(registerRecord) * 20);
-
-    // unlock
-    close(outfile);
-    for (int i = 0; i < 20; i++) {
-        printf(" id:%d, AZ:%d, BNT:%d, Moderna:%d\n",
-               reg[i].id, reg[i].AZ, reg[i].BNT, reg[i].Moderna);
-    }
-    return 1;
-}
-
-inline int read_record(int rfd, registerRecord *reg, int id) {
-    read(rfd, reg + (id - 902001), sizeof(registerRecord));
-    return 1;
-}
-
-inline int write_record(int wfd, registerRecord *reg, int id) {
+ssize_t write_record(int wfd, registerRecord *reg, int id) {
     // check and lock
-    write(wfd, reg + (id - 902001), sizeof(registerRecord));
-    return 1;
+    lseek(wfd, sizeof(registerRecord) * (id - 902001), SEEK_SET);
+    return write(wfd, reg, sizeof(registerRecord));
     // lseek(fd, sizeof())
     // unlock
 }
@@ -153,7 +105,7 @@ int handle_read(request *reqP) {
     if (r == 0)
         return 0;
     char *p1 = strstr(buf, "\015\012");  // \r\n
-    int newline_len = 2;                 // unknown usage
+    // int newline_len = 2;                 // unknown usage
     if (p1 == NULL) {
         p1 = strstr(buf, "\012");  // \n
         if (p1 == NULL) {
@@ -182,10 +134,12 @@ char msg[][100] = {
 int msglen[6];
 
 void conn_cls(int i, int conn_fd) {
+    // write(conn_fd, "debug", strlen("debug"));
     close(requestP[conn_fd].conn_fd);
     free_request(&requestP[conn_fd]);
+    fds[i] = fds[fdsn];
     fdsn--;
-    fds[i] = fds[fds[fdsn].fd];
+    // fds[i] = fds[fds[fdsn].fd];
 }
 
 void handle_err(int i, int fd) {
@@ -236,7 +190,8 @@ int main(int argc, char **argv) {
     while (true) {
         // TODO: Add IO multiplexing
         int n = poll(fds, fdsn + 1, -1);  // n: the number of fds available
-        fprintf(stderr, "fdsn: %d\n", fdsn);
+        // fprintf(stderr, "fdsn: %d\n", fdsn);
+        // fprintf(stderr, "flag0\n");
         for (int i = fdsn; i >= 0 && n > 0; i--) {
             if (!(fds[i].revents & POLLIN))  // not ready
                 continue;
@@ -259,7 +214,8 @@ int main(int argc, char **argv) {
                 requestP[conn_fd].conn_fd = conn_fd;
                 strcpy(requestP[conn_fd].host, inet_ntoa(cliaddr.sin_addr));
                 fprintf(stderr, "getting a new request... fd %d from %s\n", conn_fd, requestP[conn_fd].host);
-
+                fcntl(conn_fd, F_SETFL, O_SYNC);
+                // fprintf(stderr, "to client: %s\n", msg[2]);
                 write(conn_fd, msg[2], msglen[2]);
                 // "Please enter your id (to check your preference order):\n"
                 requestP[conn_fd].stage = 0;
@@ -273,6 +229,7 @@ int main(int argc, char **argv) {
             else {  // handle client input
                 // read input
                 fd = fds[i].fd;
+                // fprintf(stderr, "flag1\n");
                 int ret = handle_read(&requestP[fd]);  // parse data from client to requestP[conn_fd].buf
                 if (ret < 0) {
                     fprintf(stderr, "bad request from %s\n", requestP[fd].host);
@@ -282,6 +239,7 @@ int main(int argc, char **argv) {
                 if (requestP[fd].stage == 0) {  // handle read id
                     // verify read id
                     bool valid = 1;
+                    // fprintf(stderr, "flag2\n");
                     if (strlen(requestP[fd].buf) != 6) valid = 0;
                     int id;
                     if (valid) {
@@ -292,15 +250,19 @@ int main(int argc, char **argv) {
                         handle_err(i, fd);
                         continue;
                     }
+                    // fprintf(stderr, "flag3\n");
                     requestP[fd].id = id;
                     // test lock
                     short lock_type = F_RDLCK;
 #ifdef WRITE_SERVER
                     lock_type = F_WRLCK;
 #endif
+                    //char ssss[100] = "fuck\n";
+                    // write(fd, ssss, strlen(ssss));
                     if (ids_avail[id - 902001] && lock(db_fd, id, lock_type) == 0) {  // lock it and do some operation
                         ids_avail[id - 902001] = 0;
-                        read(db_fd, &reg, sizeof(registerRecord));
+                        read_record(db_fd, &reg, id);
+                        // fprintf(stderr, "flag4\n");
                         char ss[100];
                         char s[4][10];
                         int AZ = reg.AZ, BNT = reg.BNT, Moderna = reg.Moderna;
@@ -308,33 +270,35 @@ int main(int argc, char **argv) {
                         strcpy(s[AZ], "AZ");
                         strcpy(s[BNT], "BNT");
                         strcpy(s[Moderna], "Moderna");
-
-                        sprintf(ss, msg[3], s[1], s[2], s[3]);
+                        snprintf(ss, 100, msg[3], s[1], s[2], s[3]);
+                        // fprintf(stderr, "to client: %s\n", ss);
                         write(fd, ss, strlen(ss));
-                        #ifdef WRITE_SERVER
+#ifdef WRITE_SERVER
                         write(fd, msg[4], msglen[4]);
                         requestP[fd].stage = 1;
-                        #elif READ_SERVER
+#elif READ_SERVER
                         unlock(db_fd, id);
-                        ids_avail[id-902001] = 1;
+                        ids_avail[id - 902001] = 1;
                         conn_cls(i, fd);
                         continue;
-                        #endif
-                    }
-                    else {  // locked
+#endif
+                    } else {  // locked
                         handle_lcked(i, fd);
                         continue;
                     }
                 }
 
                 else if (requestP[fd].stage == 1) {  // handle update preference
-
+                    // fprintf(stderr, "flag6\n");
                     bool valid = 1;
                     if (requestP[fd].buf_len != 5) valid = 0;
                     int AZ, BNT, Moderna;
                     int id = requestP[fd].id;
-                    if (requestP[fd].buf[1] != requestP[fd].buf[3]) valid = 0;
-                    if (requestP[fd].buf[1] != ' ') valid = 0;
+                    // fprintf(stderr, "flag7\n");
+                    if (valid) {
+                        if (requestP[fd].buf[1] != requestP[fd].buf[3]) valid = 0;
+                        if (requestP[fd].buf[1] != ' ') valid = 0;
+                    }
                     if (valid) {
                         AZ = requestP[fd].buf[0] - '0';
                         BNT = requestP[fd].buf[2] - '0';
@@ -343,41 +307,40 @@ int main(int argc, char **argv) {
                             if (AZ != i && BNT != i && Moderna != i) valid = 0;
                     }
                     if (!valid) {  // invalid input
+                        unlock(db_fd, id);
                         handle_err(i, fd);
                         ids_avail[id - 902001] = 1;
                         continue;
                     }
-                    
 
                     reg.id = id;
                     reg.AZ = AZ;
                     reg.BNT = BNT;
                     reg.Moderna = Moderna;
 
-                    
-                    write(db_fd, &reg, sizeof(registerRecord));
-                    unlock(fd, id);
-                    ids_avail[id-902001] = 1;
+                    write_record(db_fd, &reg, id);
+                    unlock(db_fd, id);
+                    ids_avail[id - 902001] = 1;
                     char ss[100];
                     char s[4][10];
-
+                    // fprintf(stderr, "flag8\n");
                     strcpy(s[AZ], "AZ");
                     strcpy(s[BNT], "BNT");
                     strcpy(s[Moderna], "Moderna");
-                    sprintf(ss, msg[5], id, s[1], s[2], s[3]);
-
+                    snprintf(ss, 100, msg[5], id, s[1], s[2], s[3]);
+                    // fprintf(stderr, "to client: %s\n", ss);
                     write(fd, ss, strlen(ss));
+
                     conn_cls(i, fd);
                 }
             }
             n--;
         }
-        fprintf(stderr, "tick\n");
-        sleep(1);
+        // fprintf(stderr, "tick\n");
     }
-    fprintf(stderr, "tick\n");
+    // fprintf(stderr, "tick\n");
     free(requestP);
-return 0;
+    return 0;
 }
 
 // ======================================================================================================
@@ -393,7 +356,6 @@ static void init_request(request *reqP) {
 
 static void free_request(request *reqP) {
     // free resources used by a request instance
-
     /*if (reqP->filename != NULL) {
         free(reqP->filename);
         reqP->filename = NULL;
@@ -440,6 +402,5 @@ static void init_server(unsigned short port) {
     }
     requestP[svr.listen_fd].conn_fd = svr.listen_fd;
     strcpy(requestP[svr.listen_fd].host, svr.hostname);
-
     return;
 }
